@@ -109,7 +109,38 @@ cat > /etc/logrotate.d/vault-audit <<'EOF'
 EOF
 
 # setting hourly has no effect unless logrotate actually runs hourly using cron
-mv /etc/cron.daily/logrotate /etc/cron.hourly/
+
+# check if /etc/cron.daily/logrotate exists. This does not exist on Amazon Linux 2023
+# if is does not exit, configure use systemd timer for hourly logrotate
+if [ -f /etc/cron.daily/logrotate ]; then
+  mv /etc/cron.daily/logrotate /etc/cron.hourly/
+else
+  # Create an hourly systemd timer + service for logrotate
+cat >/etc/systemd/system/logrotate-hourly.service <<'EOF'
+[Unit]
+Description=Run logrotate hourly
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate /etc/logrotate.conf
+EOF
+
+cat >/etc/systemd/system/logrotate-hourly.timer <<'EOF'
+[Unit]
+Description=Run logrotate hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now logrotate-hourly.timer
+fi
+
 
 #--------------------------------------------------------------------
 # Generate Vault's TLS certificate and key
