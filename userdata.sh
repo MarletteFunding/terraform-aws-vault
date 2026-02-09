@@ -18,6 +18,7 @@ SELF_PRIVATE_IP="$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
 # Install Datadog Agent
 #--------------------------------------------------------------------
 export DD_API_KEY="$(aws ssm get-parameter --name "${ssm_path_datadog_api_key}" --with-decryption | jq -r '.Parameter.Value')"
+export DD_LOGS_ENABLED=true
 DD_AGENT_MAJOR_VERSION=7 bash -c "$(curl -L https://s3.amazonaws.com/dd-agent/scripts/install_script.sh)"
 
 mkdir -p /etc/datadog-agent/conf.d/http_check.d
@@ -28,65 +29,29 @@ instances:
   - name: vault_http_check
     url: https://${cluster_fqdn}
 EOF
-systemctl restart datadog-agent
 
-#--------------------------------------------------------------------
-# Install Sumo Logic Collector
-#--------------------------------------------------------------------
-mkdir -p /opt/SumoCollector
-
-cat > /opt/SumoCollector/sources.json <<EOF
-{
-  "api.version": "v1",
-  "sources": [
-    {
-      "name": "SyslogMessages",
-      "sourceType": "LocalFile",
-      "automaticDateParsing": true,
-      "multilineProcessingEnabled": false,
-      "useAutolineMatching": true,
-      "forceTimeZone": false,
-      "timeZone": "UTC",
-      "category": "Vault/${cluster_name}",
-      "pathExpression": "/var/log/messages"
-    },
-    {
-      "name": "SyslogSecure",
-      "sourceType": "LocalFile",
-      "automaticDateParsing": true,
-      "multilineProcessingEnabled": false,
-      "useAutolineMatching": true,
-      "forceTimeZone": false,
-      "timeZone": "UTC",
-      "category": "Vault/${cluster_name}",
-      "pathExpression": "/var/log/secure"
-    },
-    {
-      "name": "VaultAudit",
-      "sourceType": "LocalFile",
-      "automaticDateParsing": true,
-      "multilineProcessingEnabled": false,
-      "useAutolineMatching": true,
-      "forceTimeZone": false,
-      "timeZone": "UTC",
-      "category": "Vault/${cluster_name}",
-      "pathExpression": "/var/log/vault/audit.log"
-    }
-  ]
-}
+# Datadog log collection (replaces Sumo Logic): syslog and Vault audit logs
+mkdir -p /etc/datadog-agent/conf.d/vault.d
+cat > /etc/datadog-agent/conf.d/vault.d/conf.yaml <<EOF
+logs:
+  - type: file
+    path: /var/log/messages
+    service: vault
+    source: syslog
+    tags: ["cluster_name:${cluster_name}"]
+  - type: file
+    path: /var/log/secure
+    service: vault
+    source: syslog
+    tags: ["cluster_name:${cluster_name}"]
+  - type: file
+    path: /var/log/vault/audit.log
+    service: vault
+    source: vault
+    tags: ["cluster_name:${cluster_name}"]
 EOF
 
-SUMO_ACCESS_ID="$(aws ssm get-parameter --name "${ssm_path_sumo_access_id}" | jq -r '.Parameter.Value')"
-SUMO_ACCESS_KEY="$(aws ssm get-parameter --name "${ssm_path_sumo_access_key}" --with-decryption | jq -r '.Parameter.Value')"
-wget "https://collectors.sumologic.com/rest/download/linux/64" -O SumoCollector.sh
-chmod +x SumoCollector.sh
-./SumoCollector.sh -q \
-  -dir="/opt/SumoCollector" \
-  -Vsumo.accessid="$SUMO_ACCESS_ID" \
-  -Vsumo.accesskey="$SUMO_ACCESS_KEY" \
-  -Vdescription="Vault cluster ${cluster_name}" \
-  -VsyncSources="/opt/SumoCollector/sources.json" \
-  -Vephemeral=true
+systemctl restart datadog-agent
 
 #--------------------------------------------------------------------
 # Configure Logrotate ('EOF' so the subshell doesn't execute)

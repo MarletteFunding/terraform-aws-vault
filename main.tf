@@ -1,8 +1,8 @@
 locals {
   ssm_path_vault_recovery_keys_b64 = var.ssm_path_vault_recovery_keys_b64 != "" ? var.ssm_path_vault_recovery_keys_b64 : "/${var.name}/recovery_keys_b64"
-  
+
   ssm_path_vault_root_token = var.ssm_path_vault_root_token != "" ? var.ssm_path_vault_root_token : "/${var.name}/root_token"
-  
+
 }
 
 #--------------------------------------------------------------------
@@ -183,7 +183,7 @@ data "aws_iam_policy_document" "vault_role_policy" {
     effect    = "Allow"
     actions   = ["sts:GetCallerIdentity"]
     resources = ["*"]
-  }  
+  }
 
   # statement {
   #   sid     = "PCAIssueCert"
@@ -304,23 +304,21 @@ resource "aws_security_group" "vault_cluster" {
 #--------------------------------------------------------------------
 
 resource "aws_launch_template" "vault" {
-  tags                   = var.tags
-  name                   = var.name
-  description            = "Vault cluster ${var.name} launch template"
-  image_id               = data.aws_ami.vault.id
-  user_data              = base64encode(templatefile(
+  tags        = var.tags
+  name        = var.name
+  description = "Vault cluster ${var.name} launch template"
+  image_id    = data.aws_ami.vault.id
+  user_data = base64encode(templatefile(
     "${path.module}/userdata.sh",
     {
-      aws_region         = var.region
-      kms_key_id         = aws_kms_key.vault.key_id
-      dynamodb_table     = aws_dynamodb_table.vault.name
-      acm_pca_arn        = var.acm_pca_arn
+      aws_region               = var.region
+      kms_key_id               = aws_kms_key.vault.key_id
+      dynamodb_table           = aws_dynamodb_table.vault.name
+      acm_pca_arn              = var.acm_pca_arn
       cluster_name             = var.name
       cluster_fqdn             = aws_route53_record.vault.fqdn
       dogstatsd_tags           = var.dogstatsd_tags
       ssm_path_datadog_api_key = var.ssm_path_datadog_api_key
-      ssm_path_sumo_access_id  = var.ssm_path_sumologic_access_id
-      ssm_path_sumo_access_key = var.ssm_path_sumologic_access_key
     }
   ))
   instance_type          = var.instance_type
@@ -345,7 +343,7 @@ resource "aws_launch_template" "vault" {
 
   tag_specifications {
     resource_type = "instance"
-    tags          = merge({"Name"=var.name},var.tags)
+    tags          = merge({ "Name" = var.name }, var.tags)
   }
 }
 
