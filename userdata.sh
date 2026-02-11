@@ -12,13 +12,25 @@ exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 # Set useful variables
 #--------------------------------------------------------------------
 export AWS_DEFAULT_REGION=${aws_region}
-SELF_PRIVATE_IP="$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
+# IMDSv2
+IMDS_TOKEN="$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")"
+SELF_PRIVATE_IP="$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/local-ipv4)"
 
 #--------------------------------------------------------------------
 # Install Datadog Agent
 #--------------------------------------------------------------------
 export DD_API_KEY="$(aws ssm get-parameter --name "${ssm_path_datadog_api_key}" --with-decryption | jq -r '.Parameter.Value')"
+export DD_LOGS_ENABLED=true
 DD_AGENT_MAJOR_VERSION=7 bash -c "$(curl -L https://s3.amazonaws.com/dd-agent/scripts/install_script.sh)"
+
+# Make sure logs are enabled in config (idempotent)
+if grep -q '^[#[:space:]]*logs_enabled:' /etc/datadog-agent/datadog.yaml; then
+  sed -i 's/^[#[:space:]]*logs_enabled:.*/logs_enabled: true/' /etc/datadog-agent/datadog.yaml
+else
+  echo 'logs_enabled: true' >> /etc/datadog-agent/datadog.yaml
+fi
 
 mkdir -p /etc/datadog-agent/conf.d/http_check.d
 cat > /etc/datadog-agent/conf.d/http_check.d/conf.yaml <<EOF
@@ -28,65 +40,38 @@ instances:
   - name: vault_http_check
     url: https://${cluster_fqdn}
 EOF
-systemctl restart datadog-agent
 
-#--------------------------------------------------------------------
-# Install Sumo Logic Collector
-#--------------------------------------------------------------------
-mkdir -p /opt/SumoCollector
-
-cat > /opt/SumoCollector/sources.json <<EOF
-{
-  "api.version": "v1",
-  "sources": [
-    {
-      "name": "SyslogMessages",
-      "sourceType": "LocalFile",
-      "automaticDateParsing": true,
-      "multilineProcessingEnabled": false,
-      "useAutolineMatching": true,
-      "forceTimeZone": false,
-      "timeZone": "UTC",
-      "category": "Vault/${cluster_name}",
-      "pathExpression": "/var/log/messages"
-    },
-    {
-      "name": "SyslogSecure",
-      "sourceType": "LocalFile",
-      "automaticDateParsing": true,
-      "multilineProcessingEnabled": false,
-      "useAutolineMatching": true,
-      "forceTimeZone": false,
-      "timeZone": "UTC",
-      "category": "Vault/${cluster_name}",
-      "pathExpression": "/var/log/secure"
-    },
-    {
-      "name": "VaultAudit",
-      "sourceType": "LocalFile",
-      "automaticDateParsing": true,
-      "multilineProcessingEnabled": false,
-      "useAutolineMatching": true,
-      "forceTimeZone": false,
-      "timeZone": "UTC",
-      "category": "Vault/${cluster_name}",
-      "pathExpression": "/var/log/vault/audit.log"
-    }
-  ]
-}
+# Journald log collection for vault.service
+mkdir -p /etc/datadog-agent/conf.d/journald.d
+cat >/etc/datadog-agent/conf.d/journald.d/conf.yaml <<'EOF'
+logs:
+  - type: journald
+    service: vault
+    source: vault
+    filter_unit: vault.service
 EOF
 
-SUMO_ACCESS_ID="$(aws ssm get-parameter --name "${ssm_path_sumo_access_id}" | jq -r '.Parameter.Value')"
-SUMO_ACCESS_KEY="$(aws ssm get-parameter --name "${ssm_path_sumo_access_key}" --with-decryption | jq -r '.Parameter.Value')"
-wget "https://collectors.sumologic.com/rest/download/linux/64" -O SumoCollector.sh
-chmod +x SumoCollector.sh
-./SumoCollector.sh -q \
-  -dir="/opt/SumoCollector" \
-  -Vsumo.accessid="$SUMO_ACCESS_ID" \
-  -Vsumo.accesskey="$SUMO_ACCESS_KEY" \
-  -Vdescription="Vault cluster ${cluster_name}" \
-  -VsyncSources="/opt/SumoCollector/sources.json" \
-  -Vephemeral=true
+# Vault audit log file permissions for Datadog (optional but recommended)
+dnf install -y acl
+mkdir -p /var/log/vault
+chown vault:vault /var/log/vault
+touch /var/log/vault/audit.log
+chown vault:vault /var/log/vault/audit.log
+setfacl -m u:dd-agent:r /var/log/vault/audit.log || true
+
+if ! grep -q '^tags:' /etc/datadog-agent/datadog.yaml; then
+  cat >>/etc/datadog-agent/datadog.yaml <<EOF
+
+tags:
+  - "vault_cluster:${cluster_name}"
+  - "env:${environment}"
+  - "role:vault"
+EOF
+fi
+
+usermod -aG systemd-journal dd-agent || true
+
+systemctl restart datadog-agent
 
 #--------------------------------------------------------------------
 # Configure Logrotate ('EOF' so the subshell doesn't execute)
@@ -104,12 +89,44 @@ cat > /etc/logrotate.d/vault-audit <<'EOF'
   compress
   postrotate
     kill -HUP $(cat /var/run/vault/vault.pid)
+    setfacl -m u:dd-agent:r /var/log/vault/audit.log || true
   endscript
 }
 EOF
 
 # setting hourly has no effect unless logrotate actually runs hourly using cron
-mv /etc/cron.daily/logrotate /etc/cron.hourly/
+
+# check if /etc/cron.daily/logrotate exists. This does not exist on Amazon Linux 2023
+# if is does not exit, configure use systemd timer for hourly logrotate
+if [ -f /etc/cron.daily/logrotate ]; then
+  mv /etc/cron.daily/logrotate /etc/cron.hourly/
+else
+  # Create an hourly systemd timer + service for logrotate
+cat >/etc/systemd/system/logrotate-hourly.service <<'EOF'
+[Unit]
+Description=Run logrotate hourly
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate /etc/logrotate.conf
+EOF
+
+cat >/etc/systemd/system/logrotate-hourly.timer <<'EOF'
+[Unit]
+Description=Run logrotate hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now logrotate-hourly.timer
+fi
+
 
 #--------------------------------------------------------------------
 # Generate Vault's TLS certificate and key
