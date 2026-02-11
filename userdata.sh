@@ -69,6 +69,8 @@ tags:
 EOF
 fi
 
+usermod -aG systemd-journal dd-agent || true
+
 systemctl restart datadog-agent
 
 #--------------------------------------------------------------------
