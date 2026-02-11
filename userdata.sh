@@ -12,7 +12,11 @@ exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 # Set useful variables
 #--------------------------------------------------------------------
 export AWS_DEFAULT_REGION=${aws_region}
-SELF_PRIVATE_IP="$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
+# IMDSv2
+IMDS_TOKEN="$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")"
+SELF_PRIVATE_IP="$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/local-ipv4)"
 
 #--------------------------------------------------------------------
 # Install Datadog Agent
@@ -20,6 +24,13 @@ SELF_PRIVATE_IP="$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
 export DD_API_KEY="$(aws ssm get-parameter --name "${ssm_path_datadog_api_key}" --with-decryption | jq -r '.Parameter.Value')"
 export DD_LOGS_ENABLED=true
 DD_AGENT_MAJOR_VERSION=7 bash -c "$(curl -L https://s3.amazonaws.com/dd-agent/scripts/install_script.sh)"
+
+# Make sure logs are enabled in config (idempotent)
+if grep -q '^[#[:space:]]*logs_enabled:' /etc/datadog-agent/datadog.yaml; then
+  sed -i 's/^[#[:space:]]*logs_enabled:.*/logs_enabled: true/' /etc/datadog-agent/datadog.yaml
+else
+  echo 'logs_enabled: true' >> /etc/datadog-agent/datadog.yaml
+fi
 
 mkdir -p /etc/datadog-agent/conf.d/http_check.d
 cat > /etc/datadog-agent/conf.d/http_check.d/conf.yaml <<EOF
@@ -30,26 +41,33 @@ instances:
     url: https://${cluster_fqdn}
 EOF
 
-# Datadog log collection (replaces Sumo Logic): syslog and Vault audit logs
-mkdir -p /etc/datadog-agent/conf.d/vault.d
-cat > /etc/datadog-agent/conf.d/vault.d/conf.yaml <<EOF
+# Journald log collection for vault.service
+mkdir -p /etc/datadog-agent/conf.d/journald.d
+cat >/etc/datadog-agent/conf.d/journald.d/conf.yaml <<'EOF'
 logs:
-  - type: file
-    path: /var/log/messages
-    service: vault
-    source: syslog
-    tags: ["cluster_name:${cluster_name}"]
-  - type: file
-    path: /var/log/secure
-    service: vault
-    source: syslog
-    tags: ["cluster_name:${cluster_name}"]
-  - type: file
-    path: /var/log/vault/audit.log
+  - type: journald
     service: vault
     source: vault
-    tags: ["cluster_name:${cluster_name}"]
+    filter_unit: vault.service
 EOF
+
+# Vault audit log file permissions for Datadog (optional but recommended)
+dnf install -y acl
+mkdir -p /var/log/vault
+chown vault:vault /var/log/vault
+touch /var/log/vault/audit.log
+chown vault:vault /var/log/vault/audit.log
+setfacl -m u:dd-agent:r /var/log/vault/audit.log || true
+
+if ! grep -q '^tags:' /etc/datadog-agent/datadog.yaml; then
+  cat >>/etc/datadog-agent/datadog.yaml <<EOF
+
+tags:
+  - "vault_cluster:${cluster_name}"
+  - "env:${environment}"
+  - "role:vault"
+EOF
+fi
 
 systemctl restart datadog-agent
 
@@ -69,6 +87,7 @@ cat > /etc/logrotate.d/vault-audit <<'EOF'
   compress
   postrotate
     kill -HUP $(cat /var/run/vault/vault.pid)
+    setfacl -m u:dd-agent:r /var/log/vault/audit.log || true
   endscript
 }
 EOF

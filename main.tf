@@ -319,6 +319,7 @@ resource "aws_launch_template" "vault" {
       cluster_fqdn             = aws_route53_record.vault.fqdn
       dogstatsd_tags           = var.dogstatsd_tags
       ssm_path_datadog_api_key = var.ssm_path_datadog_api_key
+      environment              = var.environment
     }
   ))
   instance_type          = var.instance_type
